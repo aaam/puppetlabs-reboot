@@ -1,11 +1,9 @@
-require 'puppet/type'
-require 'open3'
-
 Puppet::Type.type(:reboot).provide :windows do
-  confine :kernel => :windows
-  defaultfor :kernel => :windows
+  confine :operatingsystem => :windows
+  defaultfor :operatingsystem => :windows
 
-  has_features :manages_reboot_pending, :supports_reboot_prompting
+  has_features :manages_reboot_pending
+  attr_accessor :reboot_required
 
   def self.shutdown_command
     if File.exists?("#{ENV['SYSTEMROOT']}\\sysnative\\shutdown.exe")
@@ -34,7 +32,12 @@ Puppet::Type.type(:reboot).provide :windows do
 
   def when=(value)
     if @resource[:when] == :pending
-      reboot
+      if @resource.class.rebooting
+        Puppet.debug("Reboot already scheduled; skipping")
+      else
+        @resource.class.rebooting = true
+        reboot
+      end
     end
   end
 
@@ -51,9 +54,6 @@ Puppet::Type.type(:reboot).provide :windows do
       cancel_transaction
     end
 
-    # for demo/testing
-    interactive = @resource[:prompt] ? '/i' : nil
-
     shutdown_path = command(:shutdown)
     unless shutdown_path
       raise ArgumentError, "The shutdown.exe command was not found. On Windows 2003 x64 hotfix 942589 must be installed to access the 64-bit version of shutdown.exe from 32-bit version of ruby.exe."
@@ -61,34 +61,27 @@ Puppet::Type.type(:reboot).provide :windows do
 
     # Reason code
     # E P     4       1       Application: Maintenance (Planned)
-    shutdown_cmd = [shutdown_path, interactive, '/r', '/t', @resource[:timeout], '/d', 'p:4:1', '/c', "\"#{@resource[:message]}\""].join(' ')
+    shutdown_cmd = [shutdown_path, '/r', '/t', @resource[:timeout], '/d', 'p:4:1', '/c', "\"#{@resource[:message]}\""].join(' ')
     async_shutdown(shutdown_cmd)
   end
 
   def async_shutdown(shutdown_cmd)
-    if Puppet[:debug]
-      $stderr.puts(shutdown_cmd)
-    end
-
-    # execute a ruby process to shutdown after puppet exits
-    watcher = File.join(File.dirname(__FILE__), 'windows', 'watcher.rb')
-    if not File.exists?(watcher)
-      raise ArgumentError, "The watcher program #{watcher} does not exist"
-    end
-
-    Puppet.debug("Launching 'ruby.exe #{watcher}'")
-    pid = Process.spawn("ruby.exe '#{watcher}' #{Process.pid} #{@resource[:catalog_apply_timeout]} '#{shutdown_cmd}'")
-    Puppet.debug("Launched process #{pid}")
+    Puppet.debug("Adding #{shutdown_cmd} to ruby's at_exit handler")
+    at_exit { system shutdown_cmd }
   end
 
   def reboot_pending?
     # http://gallery.technet.microsoft.com/scriptcenter/Get-PendingReboot-Query-bdb79542
 
-    component_based_servicing? ||
+    reboot_required ||
+      component_based_servicing? ||
       windows_auto_update? ||
       pending_file_rename_operations? ||
       package_installer? ||
-      package_installer_syswow64?
+      package_installer_syswow64? ||
+      pending_computer_rename? ||
+      pending_dsc_reboot? ||
+      pending_ccm_reboot?
   end
 
   def vista_sp1_or_later?
@@ -119,7 +112,7 @@ Puppet::Type.type(:reboot).provide :windows do
     with_key(path) do |reg|
       renames = reg.read('PendingFileRenameOperations') rescue nil
       if renames
-        pending = renames.length > 0
+        pending = renames[1].length > 0
         if pending
           Puppet.debug("Pending reboot: HKLM\\PendingFileRenameOperations")
         end
@@ -155,6 +148,56 @@ Puppet::Type.type(:reboot).provide :windows do
     end
   end
 
+  def pending_computer_rename?
+    path = 'SYSTEM\CurrentControlSet\Control\ComputerName'
+    active_name = reg_value("#{path}\\ActiveComputerName", 'ComputerName')
+    pending_name = reg_value("#{path}\\ComputerName", 'ComputerName')
+    if active_name && pending_name && active_name != pending_name
+      Puppet.debug("Pending reboot: Computer being renamed from #{active_name} to #{pending_name}")
+      true
+    else
+      false
+    end
+  end
+
+  def pending_dsc_reboot?
+    require 'win32ole'
+    root = 'winmgmts:\\\\.\\root\\Microsoft\\Windows\\DesiredStateConfiguration'
+    reboot = false
+
+    begin
+      dsc = WIN32OLE.connect(root)
+
+      lcm = dsc.Get('MSFT_DSCLocalConfigurationManager')
+
+      config = lcm.ExecMethod_('GetMetaConfiguration')
+      reboot = config.MetaConfiguration.LCMState == 'PendingReboot'
+    rescue
+    end
+
+    Puppet.debug("Pending reboot: DSC LocalConfigurationManager LCMState") if reboot
+    reboot
+  end
+
+  def pending_ccm_reboot?
+    require 'win32ole'
+    root = 'winmgmts:\\\\.\\root\\ccm\\ClientSDK'
+    reboot = false
+
+    begin
+      ccm = WIN32OLE.connect(root)
+
+      ccm_client_utils = ccm.Get('CCM_ClientUtilities')
+
+      pending = ccm_client_utils.ExecMethod_('DetermineIfRebootPending')
+      reboot = (pending.ReturnValue == 0) && (pending.IsHardRebootPending || pending.RebootPending)
+    rescue
+    end
+
+    Puppet.debug("Pending reboot: CCM ClientUtilities") if reboot
+    reboot
+  end
+
   private
 
   def with_key(name, &block)
@@ -173,7 +216,7 @@ Puppet::Type.type(:reboot).provide :windows do
     rval = nil
 
     with_key(path) do |reg|
-      rval = reg.read(value)
+      rval = reg.read(value)[1]
     end
 
     rval

@@ -5,9 +5,13 @@ require 'puppet/provider/reboot/windows'
 
 describe Puppet::Type.type(:reboot).provider(:windows), :if => Puppet.features.microsoft_windows? do
   let(:resource) { Puppet::Type.type(:reboot).new(:provider => :windows, :name => "windows_reboot") }
-  let(:provider) { resource.provider}
+  let(:provider) { resource.provider }
   let(:native_path)     { "#{ENV['SYSTEMROOT']}\\sysnative\\shutdown.exe" }
   let(:redirected_path) { "#{ENV['SYSTEMROOT']}\\system32\\shutdown.exe" }
+
+  before :each do
+    resource.class.rebooting = false
+  end
 
   it "should be an instance of Puppet::Type::Reboot::ProviderWindows" do
     provider.must be_an_instance_of Puppet::Type::Reboot::ProviderWindows
@@ -99,14 +103,8 @@ describe Puppet::Type.type(:reboot).provider(:windows), :if => Puppet.features.m
       provider.reboot
     end
 
-    it "does not include the interactive flag by default" do
+    it "does not include the interactive flag" do
       provider.expects(:async_shutdown).with(Not(includes('/i')))
-      provider.reboot
-    end
-
-    it "includes the interactive flag if specified" do
-      resource[:prompt] = true
-      provider.expects(:async_shutdown).with(includes('/i'))
       provider.reboot
     end
 
@@ -130,36 +128,44 @@ describe Puppet::Type.type(:reboot).provider(:windows), :if => Puppet.features.m
       provider.expects(:async_shutdown).with(includes('"triggering a reboot"'))
       provider.reboot
     end
-  end
 
-  context "when executing the watcher process" do
-    let(:child_pid) { 0x1234 }
-    let(:command)  { 'cmd.exe /c echo hello' }
+    context "multiple triggered reboots" do
+      let(:resource2) { Puppet::Type.type(:reboot).new(:provider => :windows, :name => "windows_reboot2") }
+      let(:provider2) { resource2.provider }
 
-    it "spawns the watcher with the parent process id" do
-      Process.expects(:spawn).with(regexp_matches(Regexp.new(Process.pid.to_s)))
+      context "where the second resource has when set to pending" do
+        before :each do
+          resource2[:when] = :pending
+        end
 
-      provider.async_shutdown(command)
-    end
+        context "where the first resource has apply set to finished" do
+          before :each do
+            resource[:apply] = :finished
+          end
 
-    it "spawns the watcher with a 7200 second catalog_apply_timeout by default" do
-      Process.expects(:spawn).with(regexp_matches(/7200/))
+          it "should only reboot once" do
+            resource[:when] = :refreshed
+            provider.expects(:reboot)
 
-      provider.async_shutdown(command)
-    end
+            resource.refresh
 
-    it "spawns the watcher with a 10 minute catalog_apply_timeout" do
-      resource[:catalog_apply_timeout] = 10 * 60
-      Process.expects(:spawn).with(regexp_matches(/600/))
+            provider2.expects(:reboot).never
+            Puppet.expects(:debug).with(includes('already scheduled'))
+            provider2.when = :pending
+          end
 
-      provider.async_shutdown(command)
-    end
+          it "should only reboot once when the first resource has when set to pending" do
+            # this isn't supported but no harm testing that it doesn't blow up
+            resource[:when] = :pending
+            provider.expects(:reboot)
+            provider.when = :pending
 
-    it "spawns the watcher with the quoted command to execute" do
-      quoted = "'#{command}'"
-      Process.expects(:spawn).with(regexp_matches(Regexp.new(quoted)))
-
-      provider.async_shutdown(command)
+            provider2.expects(:reboot).never
+            Puppet.expects(:debug).with(includes('already scheduled'))
+            provider2.when = :pending
+          end
+        end
+      end
     end
   end
 
@@ -174,7 +180,7 @@ describe Puppet::Type.type(:reboot).provider(:windows), :if => Puppet.features.m
 
     def expects_registry_value(path, name, value)
       reg = stub('reg')
-      reg.expects(:read).with(name).returns(value)
+      reg.expects(:read).with(name).returns(['whatever_type', value])
       expects_registry_key(path).yields(reg)
     end
 
@@ -300,6 +306,189 @@ describe Puppet::Type.type(:reboot).provider(:windows), :if => Puppet.features.m
 
           provider.should_not be_package_installer_syswow64
         end
+      end
+    end
+
+    context 'Pending computer rename' do
+      let(:active_path) { 'SYSTEM\CurrentControlSet\Control\ComputerName\ActiveComputerName' }
+      let(:pending_path) { 'SYSTEM\CurrentControlSet\Control\ComputerName\ComputerName' }
+      let(:reg_name) { 'ComputerName' }
+
+      it 'reboots if the pending computer name exists and does not match active computer name' do
+        expects_registry_value(active_path, reg_name, 'Foo')
+        expects_registry_value(pending_path, reg_name, 'Bar')
+
+        provider.should be_pending_computer_rename
+      end
+
+      it 'ignores if the pending computer name matches active computer name' do
+        computer_name = 'Foo'
+        expects_registry_value(active_path, reg_name, computer_name)
+        expects_registry_value(pending_path, reg_name, computer_name)
+
+        provider.should_not be_pending_computer_rename
+      end
+
+      it 'ignores if the active computer name key is absent' do
+        expects_registry_key_not_found(active_path)
+        expects_registry_value(pending_path, reg_name, 'Foo')
+
+        provider.should_not be_pending_computer_rename
+      end
+
+      it 'ignores if pending computer name key is absent' do
+        expects_registry_value(active_path, reg_name, 'Foo')
+        expects_registry_key_not_found(pending_path)
+
+        provider.should_not be_pending_computer_rename
+      end
+    end
+
+    context 'based on DSC' do
+      let(:root)            { 'winmgmts:\\\\.\\root\\Microsoft\\Windows\\DesiredStateConfiguration' }
+      let(:dsc)             { stub('dsc') }
+      let(:lcm)             { stub('lcm') }
+      let(:ole_config)      { stub('ole_config') }
+      let(:dsc_meta_config) { stub('dsc_meta_config') }
+
+      describe 'when DSC is available on the system' do
+        before :each do
+          WIN32OLE.expects(:connect).with(root).returns(dsc)
+          dsc.expects(:Get).with('MSFT_DSCLocalConfigurationManager').returns(lcm)
+          lcm.expects(:ExecMethod_).with('GetMetaConfiguration').returns(ole_config)
+          ole_config.expects(:MetaConfiguration).returns(dsc_meta_config)
+        end
+
+        it 'reboots when DSC LCMState is "PendingReboot"' do
+          dsc_meta_config.expects(:LCMState).returns('PendingReboot')
+
+          provider.should be_pending_dsc_reboot
+        end
+
+        ['Idle', '', nil].each do |state|
+          it "does not reboot when DSC LCMState is \"#{state}\"" do
+            dsc_meta_config.expects(:LCMState).returns(state)
+
+            provider.should_not be_pending_dsc_reboot
+          end
+        end
+      end
+
+      describe 'when querying DSC on the system fails' do
+        it 'does not reboot when DSC namespace is inaccessible' do
+          WIN32OLE.expects(:connect).with(root).raises(WIN32OLERuntimeError)
+
+          provider.should_not be_pending_dsc_reboot
+        end
+
+        it 'does not reboot when MSFT_DSCLocalConfigurationManager class is inaccessible' do
+          dsc = stub('dsc')
+          WIN32OLE.expects(:connect).with(root).returns(dsc)
+          dsc.expects(:Get).with('MSFT_DSCLocalConfigurationManager').raises
+
+          provider.should_not be_pending_dsc_reboot
+        end
+      end
+    end
+
+    context 'based on CCM' do
+      let(:root)            { 'winmgmts:\\\\.\\root\\ccm\\ClientSDK' }
+      let(:ccm)             { stub('ccm') }
+      let(:client_utils)    { stub('client_utils') }
+      let(:pending)         { stub('pending') }
+
+      describe 'when CCM is available on the system' do
+        before :each do
+          WIN32OLE.expects(:connect).with(root).returns(ccm)
+          ccm.expects(:Get).with('CCM_ClientUtilities').returns(client_utils)
+          client_utils.expects(:ExecMethod_).with('DetermineIfRebootPending').returns(pending)
+        end
+
+        [-1, 1, 255].each do |return_code|
+          it "does not reboot when CCM DetermineIfRebootPending returns a non-zero code #{return_code}" do
+            pending.expects(:ReturnValue).returns(return_code)
+
+            provider.should_not be_pending_ccm_reboot
+          end
+        end
+
+        it 'reboots when CCM RebootPending has IsHardRebootPending set, but not RebootPending' do
+          pending.expects(:ReturnValue).returns(0)
+          pending.stubs(:IsHardRebootPending).returns(true)
+          pending.stubs(:RebootPending).returns(false)
+
+          provider.should be_pending_ccm_reboot
+        end
+
+        it 'reboots when CCM RebootPending has RebootPending set, but not IsHardRebootPending' do
+          pending.expects(:ReturnValue).returns(0)
+          pending.stubs(:IsHardRebootPending).returns(false)
+          pending.stubs(:RebootPending).returns(true)
+
+          provider.should be_pending_ccm_reboot
+        end
+
+        it 'does not reboot when CCM RebootPending has neither RebootPending nor IsHardRebootPending set' do
+          pending.expects(:ReturnValue).returns(0)
+          pending.stubs(:IsHardRebootPending).returns(false)
+          pending.stubs(:RebootPending).returns(false)
+
+          provider.should_not be_pending_ccm_reboot
+        end
+      end
+
+      describe 'when querying CCM on the system fails' do
+        it 'does not reboot when CCM namespace is inaccessible' do
+          WIN32OLE.expects(:connect).with(root).raises(WIN32OLERuntimeError)
+
+          provider.should_not be_pending_ccm_reboot
+        end
+
+        it 'does not reboot when CCM_ClientUtilities class is inaccessible' do
+          ccm = stub('ccm')
+          WIN32OLE.expects(:connect).with(root).returns(ccm)
+          ccm.expects(:Get).with('CCM_ClientUtilities').raises
+
+          provider.should_not be_pending_ccm_reboot
+        end
+
+        it 'does not reboot when CCM_ClientUtilities fails calling DetermineIfRebootPending' do
+          ccm = stub('ccm')
+          client_utils = stub('client_utils')
+          WIN32OLE.expects(:connect).with(root).returns(ccm)
+          ccm.expects(:Get).with('CCM_ClientUtilities').returns(client_utils)
+          client_utils.expects(:ExecMethod_).with('DetermineIfRebootPending').raises
+
+          provider.should_not be_pending_ccm_reboot
+        end
+      end
+    end
+
+    context 'with reboot_required provider property' do
+      it 'does not indicate a reboot by default' do
+        provider.reboot_required.should be_false
+      end
+
+      it 'reboots when reboot_required is set to true' do
+        provider.reboot_required = true
+
+        provider.should be_reboot_pending
+      end
+
+      it 'does not reboot when reboot_required is set to false' do
+        provider.reboot_required = false
+
+        # prevent actual reboot system state from triggering a false positive
+        provider.expects(:component_based_servicing?).returns(false)
+        provider.expects(:windows_auto_update?).returns(false)
+        provider.expects(:pending_file_rename_operations?).returns(false)
+        provider.expects(:package_installer?).returns(false)
+        provider.expects(:package_installer_syswow64?).returns(false)
+        provider.expects(:pending_computer_rename?).returns(false)
+        provider.expects(:pending_dsc_reboot?).returns(false)
+        provider.expects(:pending_ccm_reboot?).returns(false)
+
+        provider.should_not be_reboot_pending
       end
     end
   end

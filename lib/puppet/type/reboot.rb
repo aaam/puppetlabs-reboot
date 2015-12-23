@@ -55,7 +55,6 @@ Puppet::Type.newtype(:reboot) do
   EOT
 
   feature :manages_reboot_pending, "The provider can detect if a reboot is pending, and reboot as needed."
-  feature :supports_reboot_prompting, "The provider can prompt the user to continue the reboot."
 
   newparam(:name) do
     desc "The name of the reboot resource.  Used for uniqueness."
@@ -110,28 +109,6 @@ Puppet::Type.newtype(:reboot) do
     defaultto "Puppet is rebooting the computer"
   end
 
-  newparam(:prompt, {:boolean => true, :required_features => :supports_reboot_prompting}) do
-    desc "Whether to prompt the user to continue the reboot.  By default, the
-      user will not be prompted."
-    newvalues(:true, :false)
-    defaultto(false)
-  end
-
-  newparam(:catalog_apply_timeout) do
-    desc "The maximum amount of time in seconds to wait for puppet to finish
-      applying the catalog.  If puppet is still running when the timeout is
-      reached, the reboot will not be requested.  The default value is 7200
-      seconds (2 hours)."
-
-    validate do |value|
-      if value.to_s !~ /^\d+$/
-        raise ArgumentError, "The catalog_apply_timeout must be an integer."
-      end
-    end
-
-    defaultto 7200
-  end
-
   newparam(:timeout) do
     desc "The amount of time in seconds to wait between the time the reboot
       is requested and when the reboot is performed.  The default timeout
@@ -147,10 +124,26 @@ Puppet::Type.newtype(:reboot) do
     defaultto 60
   end
 
+  @rebooting = false
+
+  def self.rebooting
+    @rebooting
+  end
+
+  def self.rebooting=(value)
+    @rebooting = value
+  end
+
   def refresh
     case self[:when]
     when :refreshed
-      provider.reboot
+      if self.class.rebooting
+        Puppet.debug("Reboot already scheduled; skipping")
+      else
+        self.class.rebooting = true
+        Puppet.notice("Scheduling system reboot with message: \"#{self[:message]}\"")
+        provider.reboot
+      end
     else
       Puppet.debug("Skipping reboot")
     end

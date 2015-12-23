@@ -9,6 +9,7 @@ describe Puppet::Type.type(:reboot) do
 
   before :each do
     resource.provider = provider
+    resource.class.rebooting = false
   end
 
   it "should be an instance of Puppet::Type::Reboot" do
@@ -90,41 +91,13 @@ describe Puppet::Type.type(:reboot) do
         resource[:message] = 'a' * 8001
       }.to raise_error(Puppet::ResourceError, /The given message must not exceed 8000 characters./)
     end
-  end
 
-  context "parameter :prompt" do
-    it "should default to nil" do
-      resource[:prompt].must be_nil
-    end
-
-    it "should accept true on platforms that support prompting" do
-      reboot = Puppet::Type.type(:reboot).new(:name => 'reboot', :provider => :windows)
-      reboot[:prompt] = true
-    end
-
-    it "should reject non-boolean values on platforms that support prompting" do
-      reboot = Puppet::Type.type(:reboot).new(:name => 'reboot', :provider => :windows)
-      expect {
-        reboot[:prompt] = "I'm not sure"
-      }.to raise_error(Puppet::ResourceError, /Invalid value "I'm not sure"/)
-    end
-  end
-
-  context "parameter :catalog_apply_timeout" do
-    it "should default to 7200 seconds" do
-      resource[:catalog_apply_timeout].must == 7200
-    end
-
-    it "should accept 30 minute timeout" do
-      resource[:catalog_apply_timeout] = 30 * 60
-    end
-
-    ["later", :later, {}, [], true].each do |timeout|
-      it "should reject a non-integer (#{timeout.class}) value" do
-        expect {
-          resource[:catalog_apply_timeout] = timeout
-        }.to raise_error(Puppet::ResourceError, /The catalog_apply_timeout must be an integer/)
-      end
+    it "should be logged on reboot" do
+      resource[:message] = "Custom message"
+      logmessage = "Scheduling system reboot with message: \"Custom message\""
+      Puppet.expects(:notice).with(logmessage)
+      resource.provider.expects(:reboot)
+      resource.refresh
     end
   end
 
@@ -143,6 +116,28 @@ describe Puppet::Type.type(:reboot) do
           resource[:timeout] = timeout
         }.to raise_error(Puppet::ResourceError, /The timeout must be an integer/)
       end
+    end
+  end
+
+  context "multiple reboot resources" do
+    let(:resource2) { Puppet::Type.type(:reboot).new(:name => "reboot2") }
+    let(:provider2) { Puppet::Provider.new(resource2) }
+
+    before :each do
+      resource2.provider = provider2
+    end
+
+    it "should only reboot once even if more than one triggers" do
+      resource[:apply] = :finished
+      resource[:when] = :refreshed
+      resource.provider.expects(:reboot)
+      resource.refresh
+
+      resource2[:apply] = :finished
+      resource2[:when] = :refreshed
+      resource2.provider.expects(:reboot).never
+      Puppet.expects(:debug).with(includes('already scheduled'))
+      resource2.refresh
     end
   end
 end
